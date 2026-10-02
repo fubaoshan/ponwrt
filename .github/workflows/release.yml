@@ -1,46 +1,55 @@
+# PonWrt 自动编译工作流，GitHub Actions
+# 手动触发：Actions页面点击 Run workflow，需要输入tag版本号
 name: Release PonWrt
 
+# 触发条件：网页手动启动 workflow_dispatch
 on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag
+        description: Release tag 版本标签（例如 v1.0）
         required: true
         type: string
       prerelease:
-        description: Mark as prerelease
+        description: Mark as prerelease 是否标记为预发布版本
         required: true
         default: true
         type: boolean
 
+# 权限定义
 permissions:
   contents: read
 
+# 并发控制：同一个tag只允许一个编译任务运行
 concurrency:
   group: release-${{ inputs.tag }}
   cancel-in-progress: false
 
+# 编译任务
 jobs:
   build:
     name: Build ${{ matrix.target }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 360
+    runs-on: ubuntu-24.04  # 使用Ubuntu24.04虚拟机作为编译环境
+    timeout-minutes: 360   # 最长超时时间6小时，防止卡死
     environment: release
     strategy:
-      fail-fast: false
+      fail-fast: false  # 多个平台编译时，一个失败不终止其他任务
       matrix:
         target:
           - an7581
-          - an7583
+#          - an7583  # 注释停用，暂时不编译an7583平台；取消注释即可恢复编译
 
     steps:
+      # 检出仓库源码到编译虚拟机
       - uses: actions/checkout@v6
 
+      # 清理虚拟机磁盘空间，腾出编译所需容量
       - name: Free build space
         run: |
           sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc
           sudo apt-get clean
 
+      # 安装编译依赖包，OpenWrt编译必备工具链
       - name: Install build dependencies
         env:
           DEBIAN_FRONTEND: noninteractive
@@ -57,6 +66,7 @@ jobs:
             qemu-utils re2c rsync scons squashfs-tools subversion swig texinfo \
             uglifyjs unzip wget xmlto xxd zlib1g-dev zstd
 
+      # 缓存dl下载目录，第二次编译不用重新下载源码包，大幅提速
       - name: Cache downloads
         uses: actions/cache@v4
         with:
@@ -65,11 +75,13 @@ jobs:
           restore-keys: |
             ponwrt-dl-${{ matrix.target }}-
 
+      # 更新并安装feeds软件源
       - name: Install feeds
         run: |
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
+      # 加载APK签名私钥（没有配置secrets时，自动跳过）
       - name: Load repository signing key
         env:
           PONWRT_APK_PRIVATE_KEY: ${{ secrets.PONWRT_APK_PRIVATE_KEY }}
@@ -80,6 +92,7 @@ jobs:
             openssl ec -in private-key.pem -pubout -out public-key.pem
           fi
 
+      # 合并配置文件：an7581基础配置 + release发布配置，生成.config
       - name: Configure ${{ matrix.target }}
         run: |
           ./scripts/kconfig.pl + \
@@ -87,34 +100,40 @@ jobs:
             configs/release.config > .config
           make defconfig
 
+      # 预下载所有源码
       - name: Download sources
         run: make download -j"$(nproc)"
 
+      # 开始编译固件，多线程编译
       - name: Build ${{ matrix.target }}
         run: make -j"$(nproc)"
 
+      # 打包编译产物，压缩为zst，作为artifact下载
       - name: Pack ${{ matrix.target }}
         run: |
           mkdir release
           tar --zstd -cf "release/ponwrt-${{ matrix.target }}.tar.zst" \
             -C bin/targets/airoha "${{ matrix.target }}"
 
+      # 上传固件包，编译完成后可以在Artifacts下载
       - name: Upload ${{ matrix.target }}
         uses: actions/upload-artifact@v4
         with:
           name: ponwrt-${{ matrix.target }}
           path: release/*.tar.zst
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 7  # 固件包保留7天
 
+  # 编译成功后，自动创建GitHub Release发布页面
   release:
     name: Create release
-    needs: build
+    needs: build  # 依赖build任务，build全部完成才执行这一步
     runs-on: ubuntu-24.04
     permissions:
       contents: write
 
     steps:
+      # 下载刚才编译产出的固件包
       - name: Download firmware archives
         uses: actions/download-artifact@v4
         with:
@@ -122,10 +141,12 @@ jobs:
           path: release
           merge-multiple: true
 
+      # 生成sha256校验文件，用来校验固件完整性
       - name: Create checksums
         working-directory: release
         run: sha256sum *.tar.zst > sha256sums
 
+      # 调用gh命令，创建Release版本
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
